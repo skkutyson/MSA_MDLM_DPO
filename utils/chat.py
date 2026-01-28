@@ -7,7 +7,7 @@ import argparse
 import numpy as np
 
 from functools import partial
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch.distributed as dist
 from sat.helpers import print_rank0
@@ -16,6 +16,7 @@ from sat.generation.utils import timed_name, generate_continually
 from sat.generation.autoregressive_sampling import update_mems, get_masks_and_position_ids_default
 
 from .utils import move_cursor_up, move_cursor_down
+from .diffusion_sampling import DiffusionSamplingStrategy, get_diffusion_strategy
 
 
 def get_masks_and_position_ids(seq, msa_len, max_gen_length, gmask=False):
@@ -294,6 +295,98 @@ def autoregressive_sampling(args, raw_text: str, model, tokenizer, strategy, str
     return answers
 
 
+def diffusion_sampling(
+    args,
+    raw_text: List[str],
+    model,
+    tokenizer,
+    strategy: DiffusionSamplingStrategy,
+) -> List[str]:
+    """
+    Generate MSA sequences using diffusion-based sampling.
+
+    Args:
+        args: Argument namespace
+        raw_text: List of input sequences (first is query, rest are MSA prompts)
+        model: MSAGPT_MDLM model
+        tokenizer: Protein tokenizer
+        strategy: Diffusion sampling strategy
+
+    Returns:
+        List of generated answer strings
+    """
+    # Build context tokens
+    # Format: [gMASK] + [sop] + query + [<M>] + prompt1 + [<M>] + ...
+    generation_mask = "[gMASK]"
+    seq = []
+    msa_len = len(raw_text[0]) + 1  # +1 for <M> delimiter
+
+    # Add mask tokens at start
+    seq += [tokenizer.get_command(generation_mask)] + [tokenizer.get_command("sop")]
+
+    # Add query and prompts
+    for each in raw_text:
+        seq += tokenizer.tokenize(each) + [tokenizer.get_command('<M>')]
+
+    context_tokens = torch.tensor([seq], dtype=torch.long, device=args.device)
+    context_len = len(seq)
+
+    # Calculate generation parameters
+    icl_msas = len(raw_text)
+    max_msa_num = (args.max_gen_length - 2) // msa_len
+    max_gen_length = max_msa_num * msa_len + 2
+
+    if args.stream_chat:
+        if args.chinese:
+            print(f"{'生成的MSA (Diffusion)'.center(30, '*')}", flush=True)
+        else:
+            print(f"{'Virtual MSA (Diffusion)'.center(30, '*')}", flush=True)
+
+    # Generate using diffusion
+    output = strategy.generate(
+        model=model,
+        context_tokens=context_tokens,
+        msa_len=msa_len,
+        max_gen_length=max_gen_length,
+    )
+
+    # Process output
+    output = output[0].tolist()  # batch_size = 1
+
+    # Find boundaries
+    mask_token = tokenizer.get_command(generation_mask)
+    sop_token = tokenizer.get_command("sop")
+    eos_token = tokenizer.get_command("eos")
+
+    # Remove special tokens and extract generated part
+    try:
+        bog = output.index(sop_token)
+    except ValueError:
+        bog = 0
+
+    # Find end of generation
+    try:
+        end_idx = output.index(eos_token)
+    except ValueError:
+        end_idx = len(output)
+
+    # Extract the generated sequence (after context)
+    generated = output[bog + 1:end_idx]
+
+    # Detokenize
+    answer = tokenizer.detokenize(generated)
+
+    if args.stream_chat:
+        # Print generated MSAs
+        vit_msa = answer.split('[<M>]')[icl_msas:]
+        vit_msa = [_ for _ in vit_msa if len(_) > 0]
+        for msa in vit_msa:
+            print(msa)
+        print()
+
+    return [answer]
+
+
 def offline_generation(args, temp, top_p, top_k, func):
     os.makedirs(args.output_path, exist_ok=True)
     with open(args.input_source, 'r', encoding="utf-8") as fin:
@@ -362,10 +455,36 @@ def online_generation(args, query, temp, top_p, top_k, func):
         
 
 def chat_api(args, model, tokenizer, strategy, query=None): # TODO: Steam chat
-    if args.input_source == 'chat':
-        assert query is not None
-        ret = online_generation(args, query, temp=args.temperature, top_p = args.top_p, top_k = args.top_k, func = partial(autoregressive_sampling, args, model = model, tokenizer = tokenizer, strategy = strategy))
-        return ret
+    # Determine backbone type
+    backbone = getattr(args, 'backbone', 'gpt')
+
+    if backbone == 'mdlm':
+        # Use diffusion-based generation
+        if args.input_source == 'chat':
+            assert query is not None
+            ret = online_generation(
+                args, query,
+                temp=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                func=partial(diffusion_sampling, args, model=model, tokenizer=tokenizer, strategy=strategy)
+            )
+            return ret
+        else:
+            assert not args.stream_chat, "Offline Generation doesn't support streaming output."
+            offline_generation(
+                args,
+                temp=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                func=partial(diffusion_sampling, args, model=model, tokenizer=tokenizer, strategy=strategy)
+            )
     else:
-        assert not args.stream_chat, "Offline Generation don't support streaming output."
-        offline_generation(args, temp=args.temperature, top_p = args.top_p, top_k = args.top_k, func = partial(autoregressive_sampling, args, model = model, tokenizer = tokenizer, strategy = strategy))
+        # Use autoregressive generation (default)
+        if args.input_source == 'chat':
+            assert query is not None
+            ret = online_generation(args, query, temp=args.temperature, top_p = args.top_p, top_k = args.top_k, func = partial(autoregressive_sampling, args, model = model, tokenizer = tokenizer, strategy = strategy))
+            return ret
+        else:
+            assert not args.stream_chat, "Offline Generation don't support streaming output."
+            offline_generation(args, temp=args.temperature, top_p = args.top_p, top_k = args.top_k, func = partial(autoregressive_sampling, args, model = model, tokenizer = tokenizer, strategy = strategy))

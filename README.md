@@ -79,9 +79,79 @@ bash scripts/cli_sat.sh --from_pretrained ./checkpoints/MSAGPT-DPO --input-sourc
 #### Situation 1.3 Web Demo
 (TODO)
 
-### Option 2：Finetuning MSAGPT
+### Option 2: Training MDLM (Masked Diffusion Language Model)
 
-(TODO)
+This repository includes training infrastructure for MDLM with DPO (Direct Preference Optimization) for protein MSA generation.
+
+#### 2.1 Data Preparation
+
+Download and process OpenProteinSet data:
+
+```bash
+# Download MSA files (requires AWS CLI: pip install awscli)
+python scripts/prepare_dataset.py download --output ./data/openproteinset --max-files 1000
+
+# Process and filter MSAs
+python scripts/prepare_dataset.py process \
+    --input ./data/openproteinset \
+    --output ./data/processed
+
+# Generate preference pairs for DPO (after pre-training)
+python scripts/prepare_dataset.py generate-preferences \
+    --model-path ./checkpoints/mdlm_pretrain/last.ckpt \
+    --input ./data/processed/msas.jsonl \
+    --output ./data/preference_pairs.jsonl
+```
+
+#### 2.2 Pre-training
+
+Train the MDLM model on MSA data:
+
+```bash
+python scripts/train_mdlm.py --config configs/train_mdlm.yaml \
+    --data.path ./data/openproteinset \
+    --training.max_steps 100000
+```
+
+Key hyperparameters (from MSAGPT paper):
+- Batch size: 48 MSAs, 12,288 residues per batch
+- Learning rate: 1.2e-4 with cosine schedule
+- Optimizer: AdamW (beta1=0.9, beta2=0.95)
+
+#### 2.3 DPO Fine-tuning
+
+Fine-tune with Direct Preference Optimization:
+
+```bash
+python scripts/train_mdlm_dpo.py --config configs/train_dpo.yaml \
+    --model.checkpoint_path ./checkpoints/mdlm_pretrain/last.ckpt \
+    --data.path ./data/preference_pairs.jsonl
+```
+
+DPO hyperparameters:
+- Learning rate: 1e-6
+- Beta (DPO temperature): 0.1
+- Lambda (CE regularization): 0.1
+
+#### 2.4 Training Infrastructure
+
+```
+training/
+├── datasets/
+│   ├── openproteinset_loader.py    # OpenProteinSet A3M/FASTA parser
+│   ├── msa_dataset.py              # Pre-training dataset with 2D positions
+│   ├── msa_preference_dataset.py   # DPO preference pairs dataset
+│   └── preference_generator.py     # Generate pairs using proxy metrics
+├── losses/
+│   ├── mdlm_loss.py                # Diffusion NLL loss (SUBS parameterization)
+│   └── mdlm_dpo_loss.py            # D3PO loss for masked diffusion
+├── trainers/
+│   ├── mdlm_trainer.py             # PyTorch Lightning pre-training module
+│   └── mdlm_dpo_trainer.py         # DPO fine-tuning module
+└── utils/
+    ├── ema.py                      # Exponential Moving Average
+    └── metrics.py                  # Perplexity, accuracy metrics
+```
 
 ### Hardware requirement
 

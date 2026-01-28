@@ -13,7 +13,9 @@ import torch.distributed as dist
 from sat.helpers import print_rank0
 from sat import mpu, get_args, get_tokenizer
 from utils import AdvancedBaseStrategy, BeamSearchStrategy
+from utils import get_diffusion_strategy
 from model_utils import MSAGPT, FineTuneMSAGPT
+from model_utils.mdlm import MSAGPT_MDLM
 from utils import chat_api
 
 
@@ -31,12 +33,34 @@ if __name__ == "__main__":
     py_parser.add_argument("--chinese", action='store_true', help='Chinese interface')
     py_parser.add_argument("--stream_chat", action='store_true', help='streaming output')
 
+    # MDLM backbone arguments
+    py_parser.add_argument("--backbone", type=str, default="gpt", choices=["gpt", "mdlm"],
+                          help="Model backbone type: 'gpt' for autoregressive, 'mdlm' for diffusion")
+    py_parser.add_argument("--num-diffusion-steps", type=int, default=256,
+                          help="Number of diffusion denoising steps (only for MDLM backbone)")
+    py_parser.add_argument("--diffusion-sampler", type=str, default="ddpm_cache",
+                          choices=["ddpm", "ddpm_cache"],
+                          help="Diffusion sampling method (only for MDLM backbone)")
 
+    # Add model-specific args based on backbone
     py_parser = MSAGPT.add_model_specific_args(py_parser)
+    py_parser = MSAGPT_MDLM.add_model_specific_args(py_parser)
+
     known, args_list = py_parser.parse_known_args()
     args = get_args(args_list)
     args = argparse.Namespace(**vars(args), **vars(known))
-    model, args = MSAGPT.from_pretrained(args.from_pretrained, args, overwrite_args={'model_parallel_size': args.model_parallel_size} if args.model_parallel_size != 1 else {})
+
+    # Load model based on backbone type
+    if args.backbone == 'mdlm':
+        model, args = MSAGPT_MDLM.from_pretrained(
+            args.from_pretrained, args,
+            overwrite_args={'model_parallel_size': args.model_parallel_size} if args.model_parallel_size != 1 else {}
+        )
+    else:
+        model, args = MSAGPT.from_pretrained(
+            args.from_pretrained, args,
+            overwrite_args={'model_parallel_size': args.model_parallel_size} if args.model_parallel_size != 1 else {}
+        )
     model.eval()
     rank = int(os.environ.get('RANK', 0))
     world_size = int(os.environ.get('WORLD_SIZE', 1))
@@ -47,10 +71,34 @@ if __name__ == "__main__":
 
     end_tokens = [tokenizer.get_command("eop"), tokenizer.get_command("eos")]
     # Get rid of all invalid tokens
-    invalid_slices = [0,26,28,29,30,31,32]
+    # Base invalid: pad (0), special chars (26), and some special tokens (28-32)
+    invalid_slices = [0, 26, 28, 29, 30, 31, 32]
+
+    # For MDLM backbone, also exclude:
+    # - Special tokens that shouldn't appear in generated MSA
+    # - All SAT padding tokens (37-127)
+    if args.backbone == 'mdlm':
+        # Add special tokens: eop(33), eos/</s>(34), DIFFUSION_MASK(36)
+        # Note: <M>(35) is allowed as MSA delimiter
+        invalid_slices.extend([33, 34, 36])
+        # Add all SAT padding tokens (37-127)
+        invalid_slices.extend(list(range(37, 128)))
+
     if args.no_gap:
         invalid_slices.append(tokenizer.TokenToId('-'))
-    if args.sampling_strategy == "BaseStrategy":
+
+    # Select strategy based on backbone type
+    if args.backbone == 'mdlm':
+        # Diffusion-based strategy
+        strategy = get_diffusion_strategy(
+            strategy_name=args.diffusion_sampler,
+            num_steps=args.num_diffusion_steps,
+            temperature=args.temperature,
+            top_k=args.top_k if args.top_k > 0 else None,
+            top_p=args.top_p if args.top_p < 1.0 else None,
+            invalid_slices=invalid_slices,
+        )
+    elif args.sampling_strategy == "BaseStrategy":
         assert not args.print_all_beams, "BaseStrategy don't support print all beams."
         strategy = AdvancedBaseStrategy(
             batch_size=1, invalid_slices = invalid_slices, temperature=args.temperature, top_k=args.top_k, top_p=args.top_p, min_gen_length=args.min_gen_length, no_repeat_ngram_size=args.no_repeat_ngram_size, end_tokens=end_tokens

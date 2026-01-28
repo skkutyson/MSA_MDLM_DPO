@@ -1,0 +1,65 @@
+# MDLM DPO Fine-tuning Configuration
+# Based on MSAGPT paper DPO hyperparameters
+
+# Model (loaded from pretrained checkpoint)
+model:
+  checkpoint_path: ./checkpoints/mdlm_pretrain/last.ckpt
+  hidden_size: 1024
+  num_attention_heads: 16
+  num_layers: 24
+  cond_dim: 256
+  mlp_ratio: 4.0
+  noise_type: loglinear
+  mask_token_id: 36
+  vocab_size: 128
+
+# Data
+data:
+  path: ./data/preference_pairs.jsonl
+  max_seq_length: 2048
+  max_msa_sequences: 8
+
+# DPO parameters (from MSAGPT paper)
+dpo:
+  beta: 0.1  # DPO temperature
+  lambda_ce: 0.1  # CE regularization weight
+
+# Training (from MSAGPT paper: LR=1e-6, batch=1, 1 epoch)
+training:
+  batch_size: 1
+  learning_rate: 1e-6
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  warmup_steps: 100
+  max_epochs: 1
+  max_steps: -1
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 8  # Effective batch size = 8
+  precision: bf16-mixed
+
+# Reference model
+reference:
+  freeze: true
+  # If not specified, copies from policy model
+
+# Diffusion
+diffusion:
+  eps: 1e-3
+
+# Hardware
+hardware:
+  devices: 2
+  strategy: ddp
+  num_workers: 48
+
+# Checkpointing
+checkpoint:
+  save_dir: ./checkpoints/mdlm_dpo
+  save_every_n_steps: 100
+  save_top_k: 3
+  monitor: val/accuracy
+
+# Logging
+logging:
+  project: mdlm-dpo
+  log_every_n_steps: 1  # Log every step for DPO

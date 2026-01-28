@@ -6,7 +6,7 @@ main_dir=$(dirname $script_dir)
 
 MP_SIZE=1
 # MODEL_NAME="MSAGPT-"
-# MODEL_NAME="MSAGPT-dpo"
+MODEL_NAME="MSAGPT-DPO"
 
 
 SEED=12345
@@ -18,11 +18,14 @@ NUM_BEAMS=4
 LENGTH_PENALTY=1.0
 NO_REPEAT_NGRAM=0
 
-# BaseStrategy args 
+# BaseStrategy args
 TEMP=0.8
 TOPK=0
 TOPP=0.9
 
+# MDLM backbone parameters (when --backbone mdlm)
+# These are passed via command line, not hardcoded here
+# Example: --backbone mdlm --num-diffusion-steps 256 --diffusion-sampler ddpm_cache
 
 PORT=19865
 
@@ -43,7 +46,7 @@ GENERATION_ARGS="--seed $SEED \
               --multiline_stream \
               --temperature $TEMP \
               --top_k $TOPK \
-              --top_p $TOPP 
+              --top_p $TOPP
 "
 # --sampling-strategy BeamSearchStrategy \
 # --no-gap

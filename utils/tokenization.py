@@ -12,14 +12,15 @@ class ResidueLevelTokenizer:
         self.all_toks = self.pad_tok
         self._tokens = ['L', 'A', 'G', 'V', 'S', 'E', 'R', 'T', 'I', 'D', 'P', 'K', 'Q', 'N', 'F', 'Y', 'M', 'H', 'W', 'C', 'X', 'B', 'U', 'Z', 'O', '.', '-']
         self.all_toks.extend(self._tokens)
-        self._special_tokens = ['MASK', 'gMASK', 'sMASK', 'eod', 'sop', 'eop', '</s>', '<M>']    
+        self._special_tokens = ['MASK', 'gMASK', 'sMASK', 'eod', 'sop', 'eop', '</s>', '<M>', 'DIFFUSION_MASK']
         self.set_special_tokens(self._special_tokens)
         self.special_tokens['eos']=self.special_tokens['</s>']
         self.special_tokens['tMASK']=self.special_tokens['MASK']
+        self.special_tokens['dMASK']=self.special_tokens['DIFFUSION_MASK']
         
         self.all_toks.extend(self._special_tokens) 
         self._vocab = {t: i for i, t in enumerate(self.all_toks)}
-        self.command_token = {'[tMASK]': 'tMASK', '[MASK]':'MASK', '[gMASK]': 'gMASK', '[sMASK]':'sMASK'}
+        self.command_token = {'[tMASK]': 'tMASK', '[MASK]':'MASK', '[gMASK]': 'gMASK', '[sMASK]':'sMASK', '[dMASK]': 'dMASK', '[DIFFUSION_MASK]': 'DIFFUSION_MASK'}
         # print('Building vocab.: {}'.format(self._vocab))
         # print('Special_tokens: {}'.format(self.special_tokens))
         # print('All tokens: {}'.format(self.all_toks))

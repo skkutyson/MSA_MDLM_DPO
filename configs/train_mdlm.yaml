@@ -1,0 +1,70 @@
+# MDLM Pre-training Configuration
+# Based on MSAGPT paper hyperparameters
+
+# Model architecture
+model:
+  hidden_size: 1024
+  num_attention_heads: 16
+  num_layers: 24
+  cond_dim: 256
+  mlp_ratio: 4.0
+  dropout: 0.0
+  noise_type: loglinear
+  mask_token_id: 36
+  vocab_size: 128  # SAT padded vocab size
+
+# Data
+data:
+  path: ./data/openproteinset
+  max_seq_length: 2048
+  max_msa_depth: 64
+  num_msa_sequences: 8
+  min_length: 25
+  max_length: 2000
+  min_identity: 0.30
+  max_gap_fraction: 0.10
+  min_sequences: 10
+
+# Training (from MSAGPT paper, batch_size=48)
+training:
+  batch_size: 2
+  max_residues_per_batch: 12288
+  learning_rate: 1.2e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  warmup_ratio: 0.025
+  max_steps: 100000
+  max_epochs: -1  # Use steps
+  gradient_clip_val: 1.0
+  accumulate_grad_batches: 1
+  precision: bf16-mixed
+
+# EMA
+ema:
+  enabled: true
+  decay: 0.9999
+  update_after_step: 1000
+  update_every: 1
+
+# Diffusion
+diffusion:
+  eps: 1e-3
+  parameterization: subs
+
+# Hardware
+hardware:
+  devices: 2
+  strategy: ddp
+  num_workers: 48
+
+# Checkpointing
+checkpoint:
+  save_dir: ./checkpoints/mdlm_pretrain
+  save_every_n_steps: 1000
+  save_top_k: 3
+  monitor: val/loss
+
+# Logging
+logging:
+  project: mdlm-pretrain
+  log_every_n_steps: 10

@@ -1,3 +1,8 @@
-numpy==1.24.1
-SwissArmyTransformer==0.4.11
-torch==2.1.0.dev20230822+cu118
+numpy
+SwissArmyTransformer
+torch
+wandb
+torchvision
+einops>=0.6.0
+awscli
+lightning
