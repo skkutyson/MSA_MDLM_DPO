@@ -211,6 +211,10 @@ Please find the 199 cases along with their retrieved MSAs in the [natural-msa-sc
 
 
 
+## Documentation
+
+- [MDLM Integration Technical Documentation](./docs/MDLM_INTEGRATION.md) - Detailed technical overview of how MDLM was integrated into MSAGPT
+
 ## License
 
 The code in this repository is open source under the [Apache-2.0 license](./LICENSE).
