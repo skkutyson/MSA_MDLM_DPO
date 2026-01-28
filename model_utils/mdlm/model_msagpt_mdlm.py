@@ -56,9 +56,12 @@ class MSAGPT_MDLM(nn.Module):
         noise_type = getattr(args, 'noise_type', 'loglinear')
         mask_token_id = getattr(args, 'mask_token_id', 36)  # DIFFUSION_MASK token ID
 
-        # Get vocab_size from args (SAT pads vocab to 128) or use provided value
+        # Get vocab_size - SAT pads vocab to 128, so always use 128
+        # SAT sets args.vocab_size to the unpadded size (e.g., 100), but the
+        # actual embedding/output dimensions use the padded size (128)
         if vocab_size is None:
-            vocab_size = getattr(args, 'vocab_size', 128)  # SAT default padded size
+            # Always use 128 (SAT's padded vocab size) regardless of args
+            vocab_size = 128
 
         # Create backbone
         self.backbone = ProteinDIT(
@@ -147,6 +150,7 @@ class MSAGPT_MDLM(nn.Module):
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
         invalid_token_ids: Optional[List[int]] = None,
+        msa_delimiter_id: int = 35,  # <M> token ID
         **kwargs
     ) -> torch.Tensor:
         """
@@ -162,6 +166,7 @@ class MSAGPT_MDLM(nn.Module):
             top_k: Top-k filtering
             top_p: Nucleus sampling threshold
             invalid_token_ids: Token IDs to never generate
+            msa_delimiter_id: Token ID for MSA delimiter <M> (default: 35)
 
         Returns:
             Generated token IDs (batch, total_len)
@@ -172,7 +177,6 @@ class MSAGPT_MDLM(nn.Module):
 
         # Calculate generation region
         # max_gen_length includes context
-        gen_len = max_gen_length - context_len
         total_len = max_gen_length
 
         # Build full sequence with masked generation region
@@ -187,6 +191,21 @@ class MSAGPT_MDLM(nn.Module):
         # Build context mask (1 for context, 0 for generation)
         context_mask = torch.zeros(batch_size, total_len, dtype=torch.long, device=device)
         context_mask[:, :context_len] = 1
+
+        # Pre-place <M> delimiter tokens at the end of each MSA block in generation region
+        # This ensures proper MSA structure: each MSA ends with <M>
+        # msa_len includes the delimiter, so actual sequence length is (msa_len - 1)
+        gen_start = context_len
+        gen_len = total_len - context_len
+        num_gen_msa = gen_len // msa_len
+
+        for msa_idx in range(num_gen_msa):
+            # Position of <M> delimiter at end of this MSA block
+            delimiter_pos = gen_start + (msa_idx + 1) * msa_len - 1
+            if delimiter_pos < total_len:
+                full_tokens[:, delimiter_pos] = msa_delimiter_id
+                # Mark delimiter positions as fixed (part of "context")
+                context_mask[:, delimiter_pos] = 1
 
         # Build 2D position IDs
         position_ids, block_position_ids = self._build_2d_positions(

@@ -342,16 +342,31 @@ def diffusion_sampling(
         else:
             print(f"{'Virtual MSA (Diffusion)'.center(30, '*')}", flush=True)
 
+    # Get <M> delimiter token ID
+    msa_delimiter_id = tokenizer.get_command('<M>')
+
     # Generate using diffusion
     output = strategy.generate(
         model=model,
         context_tokens=context_tokens,
         msa_len=msa_len,
         max_gen_length=max_gen_length,
+        msa_delimiter_id=msa_delimiter_id,
     )
 
     # Process output
     output = output[0].tolist()  # batch_size = 1
+
+    # Filter out invalid token IDs that the tokenizer can't decode
+    # SAT pads vocab to 128 but tokenizer only has ~37 valid protein tokens
+    # Valid tokens: amino acids (1-25), gap (27), special tokens (33-36)
+    # Invalid: 0 (pad), 26, 28-32, 37+ (SAT padding)
+    valid_special = {33, 34, 35, 36}  # eop, eos, <M>, DIFFUSION_MASK
+    gap_token = 27  # '-' character
+    output = [
+        t if (1 <= t <= 25 or t == 27 or t in valid_special) else gap_token
+        for t in output
+    ]
 
     # Find boundaries
     mask_token = tokenizer.get_command(generation_mask)

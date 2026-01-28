@@ -73,10 +73,44 @@ We set an input file example: *msa_input*.
 bash scripts/cli_sat.sh --from_pretrained ./checkpoints/MSAGPT-DPO --input-source <your input file> --output-path <your output path> --max-gen-length 1024
 ```
 
-#### Situation 1.2 CLI (Huggingface version)
+#### Situation 1.2 CLI with MDLM Backbone (Diffusion-based)
+
+The CLI also supports MDLM (Masked Diffusion Language Model) as an alternative backbone for MSA generation. Unlike autoregressive generation, MDLM generates all positions in parallel through iterative denoising.
+
+```bash
+# Online Chat with MDLM
+bash scripts/cli_sat.sh \
+    --from_pretrained ./checkpoints/mdlm_dpo \
+    --backbone mdlm \
+    --input-source chat \
+    --stream_chat \
+    --max-gen-length 512 \
+    --num-diffusion-steps 256 \
+    --diffusion-sampler ddpm_cache
+```
+
+```bash
+# Offline Generation with MDLM
+bash scripts/cli_sat.sh \
+    --from_pretrained ./checkpoints/mdlm_dpo \
+    --backbone mdlm \
+    --input-source <your input file> \
+    --output-path <your output path> \
+    --max-gen-length 512 \
+    --num-diffusion-steps 256
+```
+
+**MDLM-specific parameters:**
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `--backbone mdlm` | Use MDLM diffusion backbone | `gpt` |
+| `--num-diffusion-steps` | Number of denoising steps (higher = better quality) | 256 |
+| `--diffusion-sampler` | Sampling method: `ddpm` or `ddpm_cache` (faster) | `ddpm_cache` |
+
+#### Situation 1.3 CLI (Huggingface version)
 (TODO)
 
-#### Situation 1.3 Web Demo
+#### Situation 1.4 Web Demo
 (TODO)
 
 ### Option 2: Training MDLM (Masked Diffusion Language Model)

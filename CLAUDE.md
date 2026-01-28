@@ -28,6 +28,61 @@ bash scripts/cli_sat.sh --from_pretrained ./checkpoints/MSAGPT-DPO \
 
 Key parameters in `scripts/cli_sat.sh`: `MP_SIZE` (model parallelism), `NUM_BEAMS`, `TEMP`, `TOPK`, `TOPP`, `SAMPLING_STRATEGY` (BaseStrategy or BeamSearchStrategy).
 
+## Running MDLM Inference (Diffusion-based)
+
+**Interactive chat mode with MDLM:**
+```bash
+bash scripts/cli_sat.sh --from_pretrained ./checkpoints/mdlm_dpo \
+    --backbone mdlm \
+    --input-source chat \
+    --stream_chat \
+    --max-gen-length 512 \
+    --num-diffusion-steps 256 \
+    --diffusion-sampler ddpm_cache
+```
+
+**Offline batch generation with MDLM:**
+```bash
+bash scripts/cli_sat.sh --from_pretrained ./checkpoints/mdlm_dpo \
+    --backbone mdlm \
+    --input-source <input_file> \
+    --output-path <output_path> \
+    --max-gen-length 512
+```
+
+**MDLM-specific parameters:**
+- `--backbone mdlm`: Use diffusion backbone instead of autoregressive
+- `--num-diffusion-steps`: Denoising steps (default: 256, higher = better quality)
+- `--diffusion-sampler`: `ddpm` or `ddpm_cache` (faster, default)
+
+**Python API for MDLM:**
+```python
+from model_utils.mdlm import MSAGPT_MDLM
+from utils.tokenization import proteinglm_tokenizer
+import torch
+
+# Load model
+model, args = MSAGPT_MDLM.from_pretrained('./checkpoints/mdlm_dpo', args)
+model = model.cuda().eval()
+tokenizer = proteinglm_tokenizer()
+
+# Prepare input
+query = "MVLSPADKTNVKAAWGKVGAHAGEYGAEALERMFLSFPTTK"
+seq = [tokenizer.get_command('[gMASK]'), tokenizer.get_command('sop')]
+seq += tokenizer.tokenize(query) + [tokenizer.get_command('<M>')]
+context_tokens = torch.tensor([seq]).cuda()
+
+# Generate
+output = model.generate(
+    context_tokens=context_tokens,
+    msa_len=len(query) + 1,
+    max_gen_length=512,
+    num_steps=256,
+    msa_delimiter_id=tokenizer.get_command('<M>'),
+)
+print(tokenizer.detokenize(output[0].tolist()))
+```
+
 ## Architecture
 
 ```
