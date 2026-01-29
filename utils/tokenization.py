@@ -10,17 +10,18 @@ class ResidueLevelTokenizer:
         super(ResidueLevelTokenizer, self).__init__()
         self.pad_tok = ['[pad]']
         self.all_toks = self.pad_tok
+        # Keep only amino acids used in proteins
         self._tokens = ['L', 'A', 'G', 'V', 'S', 'E', 'R', 'T', 'I', 'D', 'P', 'K', 'Q', 'N', 'F', 'Y', 'M', 'H', 'W', 'C', 'X', 'B', 'U', 'Z', 'O', '.', '-']
         self.all_toks.extend(self._tokens)
-        self._special_tokens = ['MASK', 'gMASK', 'sMASK', 'eod', 'sop', 'eop', '</s>', '<M>', 'DIFFUSION_MASK']
+        # Keep only special tokens actually used in MDLM training
+        # Removed unused: MASK, sMASK, eod, eop, </s>
+        self._special_tokens = ['gMASK', 'sop', '<M>', 'DIFFUSION_MASK']
         self.set_special_tokens(self._special_tokens)
-        self.special_tokens['eos']=self.special_tokens['</s>']
-        self.special_tokens['tMASK']=self.special_tokens['MASK']
         self.special_tokens['dMASK']=self.special_tokens['DIFFUSION_MASK']
         
         self.all_toks.extend(self._special_tokens) 
         self._vocab = {t: i for i, t in enumerate(self.all_toks)}
-        self.command_token = {'[tMASK]': 'tMASK', '[MASK]':'MASK', '[gMASK]': 'gMASK', '[sMASK]':'sMASK', '[dMASK]': 'dMASK', '[DIFFUSION_MASK]': 'DIFFUSION_MASK'}
+        self.command_token = {'[gMASK]': 'gMASK', '[dMASK]': 'dMASK', '[DIFFUSION_MASK]': 'DIFFUSION_MASK'}
         # print('Building vocab.: {}'.format(self._vocab))
         # print('Special_tokens: {}'.format(self.special_tokens))
         # print('All tokens: {}'.format(self.all_toks))

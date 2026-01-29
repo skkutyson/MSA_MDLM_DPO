@@ -1,7 +1,6 @@
-# MDLM Pre-training Configuration
-# Based on MSAGPT paper hyperparameters
+# MDLM Pre-training with Few-Shot Learning
+# Few-shot 모드: Query + 2-3개 예제 MSA를 조건으로 사용
 
-# Model architecture
 model:
   hidden_size: 1024
   num_attention_heads: 16
@@ -11,33 +10,33 @@ model:
   dropout: 0.0
   noise_type: loglinear
   mask_token_id: 36
-  vocab_size: 128  # SAT padded vocab size
+  vocab_size: 128
 
-# Data
+# Data with Few-Shot Learning
 data:
   path: ./data/openproteinset
   max_seq_length: 2048
   max_msa_depth: 64
-  num_msa_sequences: 8
+  num_msa_sequences: 6          # ← 감소 (메모리 때문)
   min_length: 25
   max_length: 2000
   min_identity: 0.30
   max_gap_fraction: 0.10
   min_sequences: 10
-  # Few-shot learning options
-  use_few_shot: false           # Enable few-shot learning
-  few_shot_examples: 2          # Number of example MSAs in context (2-3)
+  
+  # Few-shot 설정
+  use_few_shot: true            # ← Few-shot 활성화!
+  few_shot_examples: 2          # ← 예제 MSA 2개
+                                # (3개도 가능하지만 메모리 증가)
 
-# Training (from MSAGPT paper, batch_size=48)
+# Training
 training:
   batch_size: 2
-  max_residues_per_batch: 12288
   learning_rate: 1.2e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]
   warmup_ratio: 0.025
   max_steps: 100000
-  max_epochs: -1  # Use steps
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1
   precision: bf16-mixed
@@ -56,18 +55,18 @@ diffusion:
 
 # Hardware
 hardware:
-  devices: 1  # Single GPU (DDP disabled)
-  strategy: auto
+  devices: 2
+  strategy: ddp
   num_workers: 48
 
 # Checkpointing
 checkpoint:
-  save_dir: ./checkpoints/mdlm_pretrain
+  save_dir: ./checkpoints/mdlm_pretrain_fewshot
   save_every_n_steps: 1000
   save_top_k: 3
   monitor: val/loss
 
 # Logging
 logging:
-  project: mdlm-pretrain
+  project: mdlm-pretrain-fewshot
   log_every_n_steps: 10

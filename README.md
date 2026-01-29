@@ -107,6 +107,52 @@ bash scripts/cli_sat.sh \
 | `--num-diffusion-steps` | Number of denoising steps (higher = better quality) | 256 |
 | `--diffusion-sampler` | Sampling method: `ddpm` or `ddpm_cache` (faster) | `ddpm_cache` |
 
+#### Few-Shot MSA Generation Mode
+
+Both GPT and MDLM backbones support **few-shot learning** where you provide a few example MSAs to guide generation.
+
+**How it works:**
+- Provide 2-3 example MSAs as context (separated by `<M>`)
+- The model conditions on these examples to generate similar MSAs
+- Improves quality when natural MSAs have specific patterns
+
+**Example with GPT backbone:**
+```bash
+# Online chat with few-shot prompt
+bash scripts/cli_sat.sh \
+    --from_pretrained ./checkpoints/MSAGPT-DPO \
+    --input-source chat \
+    --max-gen-length 1024
+
+# Enter query with examples (in chat):
+# PEGKQGDPGIPGEPGPPGPPGPQGARGPPG<M>VTVEFVNSCLIGDMGVDGPPGQQGQPGPPG<M>PEGKQGEPGIPGEPGPPGPPGPQGARGQPG
+```
+
+**Example with MDLM backbone:**
+```bash
+# Create input file with few-shot examples
+echo "MVLKKVDPL<M>MVLKKVD--<M>MVLKAVDPL" > msa_fewshot.txt
+
+# Generate with MDLM
+bash scripts/cli_sat.sh \
+    --from_pretrained ./checkpoints/mdlm_dpo \
+    --backbone mdlm \
+    --input-source msa_fewshot.txt \
+    --output-path ./output_fewshot.txt \
+    --max-gen-length 512 \
+    --num-diffusion-steps 256
+```
+
+**Format:**
+- `<Query Sequence><M><Example MSA 1><M><Example MSA 2><M>...`
+- The model will generate additional MSAs following the pattern of your examples
+- Recommended: 2-3 examples for best results
+
+**When to use few-shot:**
+- You have natural MSAs but want more diversity
+- The protein has specific conserved regions you want to maintain
+- You want to guide generation with known homologs
+
 #### Situation 1.3 CLI (Huggingface version)
 (TODO)
 

@@ -154,11 +154,53 @@ def main():
 
     # Create datasets
     data_config = config['data']
+    
+    # Check if using processed JSONL or raw directory
+    data_path = data_config['path']
+    
+    if isinstance(data_path, str) and data_path.endswith('.jsonl'):
+        # Load from processed JSONL (much faster!)
+        import json
+        from training.datasets.openproteinset_loader import MSAEntry
+        
+        logger.info(f"Loading from processed JSONL: {data_path}")
+        msa_entries = []
+        with open(data_path, 'r') as f:
+            for line in f:
+                item = json.loads(line)
+                entry = MSAEntry(
+                    id=item['id'],
+                    query_sequence=item['query'],
+                    aligned_sequences=item['sequences'],
+                    sequence_ids=[f"seq_{i}" for i in range(len(item['sequences']))],
+                )
+                msa_entries.append(entry)
+        
+        logger.info(f"Loaded {len(msa_entries)} MSA entries from JSONL")
+    else:
+        # Load from raw directory (slow - scans all files)
+        from training.datasets.openproteinset_loader import OpenProteinSetLoader
+        
+        logger.info(f"Loading from raw directory: {data_path}")
+        loader = OpenProteinSetLoader(data_path)
+        
+        # Optionally limit to first N samples for faster iteration
+        max_samples = data_config.get('max_samples', None)
+        if max_samples:
+            import itertools
+            logger.info(f"Loading first {max_samples} samples only (for quick testing)")
+            msa_entries = list(itertools.islice(loader, max_samples))
+        else:
+            logger.info("Loading all samples (this may take several minutes)...")
+            msa_entries = list(loader)
+    
     train_dataset = MSADataset(
-        data_source=data_config['path'],
+        data_source=msa_entries,
         max_seq_length=data_config.get('max_seq_length', 2048),
         max_msa_depth=data_config.get('max_msa_depth', 64),
         num_msa_sequences=data_config.get('num_msa_sequences', 8),
+        use_few_shot=data_config.get('use_few_shot', False),
+        few_shot_examples=data_config.get('few_shot_examples', 2),
     )
 
     # Check for empty dataset

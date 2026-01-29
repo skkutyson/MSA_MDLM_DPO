@@ -23,11 +23,9 @@ logger = logging.getLogger(__name__)
 SPECIAL_TOKENS = {
     'pad': 0,
     'gMASK': 28,
-    'sop': 31,
-    'eop': 32,
-    'eos': 33,
-    '<M>': 34,  # MSA delimiter
-    'DIFFUSION_MASK': 36,
+    'sop': 29,
+    '<M>': 30,  # MSA delimiter
+    'DIFFUSION_MASK': 31,
 }
 
 # Standard amino acid tokens (indices 1-27 in vocab)
@@ -50,15 +48,10 @@ class MSATokenizer:
 
         # Special tokens
         self.special_tokens = {
-            'MASK': 27,
             'gMASK': 28,
-            'sMASK': 29,
-            'eod': 30,
-            'sop': 31,
-            'eop': 32,
-            '</s>': 33,
-            '<M>': 34,
-            'DIFFUSION_MASK': 36,
+            'sop': 29,
+            '<M>': 30,
+            'DIFFUSION_MASK': 31,
         }
         self.vocab.update(self.special_tokens)
 
@@ -70,7 +63,29 @@ class MSATokenizer:
         self.sop_id = self.special_tokens['sop']
         self.msa_delimiter_id = self.special_tokens['<M>']
         self.mask_id = self.special_tokens['DIFFUSION_MASK']
-        self.eos_id = self.special_tokens['</s>']
+        self.eos_id = None
+
+        # Optional runtime validation against main tokenizer
+        try:
+            from utils import proteinglm_tokenizer
+            pt = proteinglm_tokenizer()
+            if len(self.vocab) != pt.vocab_size:
+                raise ValueError(
+                    f"MSATokenizer vocab size ({len(self.vocab)}) != proteinglm ({pt.vocab_size})"
+                )
+            expected = {
+                'gMASK': pt.get_command('gMASK'),
+                'sop': pt.get_command('sop'),
+                '<M>': pt.get_command('<M>'),
+                'DIFFUSION_MASK': pt.get_command('DIFFUSION_MASK'),
+            }
+            for key, val in expected.items():
+                if self.special_tokens.get(key) != val:
+                    raise ValueError(
+                        f"Token ID mismatch for {key}: {self.special_tokens.get(key)} != {val}"
+                    )
+        except Exception as e:
+            logger.warning(f"Tokenizer validation skipped or failed: {e}")
 
     def encode(self, sequence: str) -> List[int]:
         """Encode a protein sequence to token IDs."""
@@ -118,6 +133,8 @@ class MSADataset(Dataset):
         num_msa_sequences: int = 8,
         include_query_in_context: bool = True,
         cache_dir: Optional[str] = None,
+        use_few_shot: bool = False,
+        few_shot_examples: int = 2,
     ):
         """
         Initialize the dataset.
@@ -130,12 +147,16 @@ class MSADataset(Dataset):
             num_msa_sequences: Number of MSA sequences to sample per example
             include_query_in_context: Whether query is context (not masked)
             cache_dir: Directory for caching processed data
+            use_few_shot: Whether to use few-shot learning mode
+            few_shot_examples: Number of example MSA sequences in context (2-3)
         """
         self.tokenizer = tokenizer or MSATokenizer()
         self.max_seq_length = max_seq_length
         self.max_msa_depth = max_msa_depth
         self.num_msa_sequences = num_msa_sequences
         self.include_query_in_context = include_query_in_context
+        self.use_few_shot = use_few_shot
+        self.few_shot_examples = few_shot_examples if use_few_shot else 0
 
         # Load data
         if isinstance(data_source, str):
@@ -163,25 +184,61 @@ class MSADataset(Dataset):
     def __len__(self) -> int:
         return len(self.msa_entries)
 
-    def _sample_msa_sequences(self, msa_entry: MSAEntry) -> List[str]:
-        """Sample a subset of MSA sequences."""
+    def _sample_msa_sequences(self, msa_entry: MSAEntry) -> Tuple[List[str], List[str]]:
+        """
+        Sample MSA sequences.
+        
+        In few-shot mode:
+        - Returns (context_examples, generation_targets)
+        - context_examples: 2-3 example MSAs to condition on
+        - generation_targets: remaining MSAs to generate
+        
+        In normal mode:
+        - Returns ([], all_msa_sequences)
+        """
         aligned_seqs = msa_entry.aligned_sequences[:self.max_msa_depth]
-
-        if len(aligned_seqs) <= self.num_msa_sequences:
-            return aligned_seqs
-
-        # Random sampling
-        return random.sample(aligned_seqs, self.num_msa_sequences)
+        
+        if not self.use_few_shot:
+            # Normal mode: all seqs are generation targets
+            sampled = aligned_seqs if len(aligned_seqs) <= self.num_msa_sequences else random.sample(aligned_seqs, self.num_msa_sequences)
+            return [], sampled
+        
+        # Few-shot mode: split context examples and generation targets
+        total_needed = self.few_shot_examples + self.num_msa_sequences
+        
+        if len(aligned_seqs) <= total_needed:
+            # Not enough seqs, use what we have
+            context_examples = aligned_seqs[:self.few_shot_examples]
+            generation_targets = aligned_seqs[self.few_shot_examples:]
+        else:
+            # Sample randomly
+            sampled = random.sample(aligned_seqs, total_needed)
+            context_examples = sampled[:self.few_shot_examples]
+            generation_targets = sampled[self.few_shot_examples:]
+        
+        return context_examples, generation_targets
 
     def _build_input(
         self,
         query: str,
         msa_sequences: List[str],
+        few_shot_examples: Optional[List[str]] = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Build input tensors for a single MSA example.
 
-        Format: [gMASK, sop, query..., <M>, seq1..., <M>, seq2..., ...]
+        Normal mode format: 
+            [gMASK, sop, query..., <M>, seq1..., <M>, seq2..., ...]
+
+        Few-shot mode format:
+            [gMASK, sop, query..., <M>, example1..., <M>, example2..., <M>, seq1..., <M>, seq2..., ...]
+            Context:    ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^
+            Generation:                                                      ^^^^^^^^^^^^^^
+
+        Args:
+            query: Query sequence
+            msa_sequences: Sequences to generate (context_mask=0)
+            few_shot_examples: Optional example sequences (context_mask=1)
 
         Returns dictionary with:
         - input_ids: Token IDs
@@ -209,14 +266,43 @@ class MSADataset(Dataset):
 
         context_mask = [1, 1]  # Special tokens are context
         context_mask.extend([1] * len(query_ids))  # Query is context
+        
+        current_block = 1
 
-        # Add MSA sequences
-        for msa_idx, msa_seq in enumerate(msa_sequences, start=1):
+        # Add few-shot examples (if provided) - CONTEXT
+        if few_shot_examples:
+            for example_seq in few_shot_examples:
+                # Add delimiter
+                input_ids.append(self.tokenizer.msa_delimiter_id)
+                position_ids.append(0)
+                block_position_ids.append(current_block)
+                context_mask.append(1)  # ← Few-shot examples are CONTEXT!
+                
+                # Tokenize example
+                example_tokens = self.tokenizer.encode(example_seq)
+                
+                # Truncate if needed
+                remaining_space = self.max_seq_length - len(input_ids) - 1
+                if len(example_tokens) > remaining_space:
+                    example_tokens = example_tokens[:remaining_space]
+                
+                input_ids.extend(example_tokens)
+                position_ids.extend(range(len(example_tokens)))
+                block_position_ids.extend([current_block] * len(example_tokens))
+                context_mask.extend([1] * len(example_tokens))  # ← Few-shot examples are CONTEXT!
+                
+                current_block += 1
+                
+                if len(input_ids) >= self.max_seq_length:
+                    break
+
+        # Add generation target MSA sequences - GENERATION
+        for msa_seq in msa_sequences:
             # Add delimiter
             input_ids.append(self.tokenizer.msa_delimiter_id)
             position_ids.append(0)  # Delimiter position
-            block_position_ids.append(msa_idx)
-            context_mask.append(0)  # Delimiter is part of generation
+            block_position_ids.append(current_block)
+            context_mask.append(0)  # ← Generation targets
 
             # Tokenize MSA sequence
             msa_tokens = self.tokenizer.encode(msa_seq)
@@ -228,8 +314,10 @@ class MSADataset(Dataset):
 
             input_ids.extend(msa_tokens)
             position_ids.extend(range(len(msa_tokens)))
-            block_position_ids.extend([msa_idx] * len(msa_tokens))
-            context_mask.extend([0] * len(msa_tokens))  # MSA is generated
+            block_position_ids.extend([current_block] * len(msa_tokens))
+            context_mask.extend([0] * len(msa_tokens))  # ← Generation targets
+
+            current_block += 1
 
             # Check if we've reached max length
             if len(input_ids) >= self.max_seq_length:
@@ -260,10 +348,17 @@ class MSADataset(Dataset):
         msa_entry = self.msa_entries[idx]
 
         # Sample MSA sequences
-        msa_sequences = self._sample_msa_sequences(msa_entry)
+        if self.use_few_shot:
+            few_shot_examples, msa_sequences = self._sample_msa_sequences(msa_entry)
+        else:
+            few_shot_examples, msa_sequences = None, self._sample_msa_sequences(msa_entry)[1]
 
         # Build input tensors
-        return self._build_input(msa_entry.query_sequence, msa_sequences)
+        return self._build_input(
+            msa_entry.query_sequence,
+            msa_sequences,
+            few_shot_examples=few_shot_examples if self.use_few_shot else None
+        )
 
 
 class MSACollator:
