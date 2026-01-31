@@ -12,6 +12,13 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from einops import rearrange
 
+# Try to import FlashAttention
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+
 
 class ProteinRotary2D(nn.Module):
     """
@@ -168,11 +175,13 @@ class DITBlock(nn.Module):
         cond_dim: int,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        use_flash_attn: bool = True,
     ):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self.use_flash_attn = use_flash_attn and FLASH_ATTN_AVAILABLE
 
         # Self-attention
         self.q_proj = nn.Linear(hidden_size, hidden_size)
@@ -200,6 +209,7 @@ class DITBlock(nn.Module):
         self.adaln_mlp = AdaLN(hidden_size, cond_dim)
 
         self.dropout = nn.Dropout(dropout)
+        self.attn_dropout_p = dropout
 
     def forward(
         self,
@@ -239,24 +249,50 @@ class DITBlock(nn.Module):
         # Apply 2D rotary embeddings
         q, k = self.rotary(q, k, position_ids, block_position_ids)
 
-        # Scaled dot-product attention
-        scale = 1.0 / math.sqrt(self.head_dim)
-        attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+        # Use FlashAttention if available and enabled
+        if self.use_flash_attn and attention_mask is None:
+            # FlashAttention expects (batch, seq, heads, head_dim)
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
 
-        if attention_mask is not None:
-            if attention_mask.dim() == 2:
-                # (batch, seq) -> (batch, 1, 1, seq)
-                attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
-            attn_weights = attn_weights.masked_fill(attention_mask == 0, float('-inf'))
+            # Convert to half precision for FlashAttention if needed
+            dtype = q.dtype
+            if dtype not in [torch.float16, torch.bfloat16]:
+                q, k, v = q.half(), k.half(), v.half()
 
-        attn_weights = F.softmax(attn_weights, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+            attn_output = flash_attn_func(
+                q, k, v,
+                dropout_p=self.attn_dropout_p if self.training else 0.0,
+                causal=False,
+            )
 
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, v)
+            # Convert back to original dtype
+            if dtype not in [torch.float16, torch.bfloat16]:
+                attn_output = attn_output.to(dtype)
 
-        # Reshape and project
-        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+            # Reshape: (batch, seq, heads, head_dim) -> (batch, seq, hidden)
+            attn_output = attn_output.reshape(batch_size, seq_len, self.hidden_size)
+        else:
+            # Fallback to standard attention
+            scale = 1.0 / math.sqrt(self.head_dim)
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+            if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    # (batch, seq) -> (batch, 1, 1, seq)
+                    attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                attn_weights = attn_weights.masked_fill(attention_mask == 0, float('-inf'))
+
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+
+            # Apply attention to values
+            attn_output = torch.matmul(attn_weights, v)
+
+            # Reshape: (batch, heads, seq, head_dim) -> (batch, seq, hidden)
+            attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+
         attn_output = self.out_proj(attn_output)
         attn_output = self.dropout(attn_output)
 
@@ -293,6 +329,7 @@ class ProteinDIT(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         max_seq_len: int = 2048,
+        use_flash_attn: bool = True,
     ):
         """
         Args:
@@ -304,6 +341,7 @@ class ProteinDIT(nn.Module):
             mlp_ratio: MLP hidden dimension ratio
             dropout: Dropout probability
             max_seq_len: Maximum sequence length
+            use_flash_attn: Whether to use FlashAttention
         """
         super().__init__()
         self.vocab_size = vocab_size
@@ -329,6 +367,7 @@ class ProteinDIT(nn.Module):
                 cond_dim=cond_dim,
                 mlp_ratio=mlp_ratio,
                 dropout=dropout,
+                use_flash_attn=use_flash_attn,
             )
             for _ in range(num_layers)
         ])

@@ -171,15 +171,15 @@ Download and process OpenProteinSet data:
 # Download MSA files (requires AWS CLI: pip install awscli)
 python scripts/prepare_dataset.py download --output ./data/openproteinset --max-files 1000
 
-# Process and filter MSAs
+# Process and filter MSAs (outputs parquet format for fast loading)
 python scripts/prepare_dataset.py process \
     --input ./data/openproteinset \
-    --output ./data/processed
+    --output ./data/processed/msa_data.parquet
 
 # Generate preference pairs for DPO (after pre-training)
 python scripts/prepare_dataset.py generate-preferences \
     --model-path ./checkpoints/mdlm_pretrain/last.ckpt \
-    --input ./data/processed/msas.jsonl \
+    --input ./data/processed/msa_data.parquet \
     --output ./data/preference_pairs.jsonl
 ```
 
@@ -188,10 +188,31 @@ python scripts/prepare_dataset.py generate-preferences \
 Train the MDLM model on MSA data:
 
 ```bash
+# Using parquet format (10-100x faster loading)
+python scripts/train_mdlm.py --config configs/train_mdlm.yaml \
+    --data.path ./data/processed/msa_data.parquet \
+    --training.max_steps 100000
+
+# Or using raw A3M directory (slower)
 python scripts/train_mdlm.py --config configs/train_mdlm.yaml \
     --data.path ./data/openproteinset \
     --training.max_steps 100000
 ```
+
+**Fast loader (recommended):**
+- Parquet uses memory-mapped loading (10-100x faster than raw A3M).
+- Output schema: `id`, `query`, `sequences_json`, `depth`, `length`.
+
+**FlashAttention (optional, faster attention):**
+```bash
+pip install flash-attn --no-build-isolation
+```
+If `flash_attn` is installed, it is auto-detected and used in the MDLM backbone.
+
+**Sampling time direction (important):**
+- Noise schedule follows standard convention: $t$ increases → $\sigma(t)$ increases.
+- **Sampling/denoising runs backward in time:** start at $t=1$ (fully masked) and step to $t=0$ (clean).
+- Re-masking uses $\sigma_{t-\Delta t}$ directly (lower $\sigma$ → fewer re-masks).
 
 Key hyperparameters (from MSAGPT paper):
 - Batch size: 48 MSAs, 12,288 residues per batch

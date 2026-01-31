@@ -66,8 +66,15 @@ def process_command(args):
         min_sequences=args.min_sequences,
     )
 
-    output_dir = Path(args.output)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = Path(args.output)
+    
+    # Create parent directory if output is a file path
+    if output_path.suffix:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_dir = output_path.parent
+    else:
+        output_path.mkdir(parents=True, exist_ok=True)
+        output_dir = output_path
 
     # Save filtered MSAs as JSON
     processed = []
@@ -86,13 +93,34 @@ def process_command(args):
         if args.max_samples and len(processed) >= args.max_samples:
             break
 
-    # Save to JSONL
-    output_path = output_dir / 'msas.jsonl'
-    with open(output_path, 'w') as f:
+    # Determine output format from path
+    if str(args.output).endswith('.parquet'):
+        # Save as Parquet (fast loading format)
+        import pandas as pd
+        
+        # Convert sequences list to JSON string for parquet storage
+        df_data = []
         for item in processed:
-            f.write(json.dumps(item) + '\n')
-
-    logger.info(f"Saved {len(processed)} MSAs to {output_path}")
+            df_data.append({
+                'id': item['id'],
+                'query': item['query'],
+                'sequences_json': json.dumps(item['sequences']),
+                'depth': item['depth'],
+                'length': item['length'],
+            })
+        
+        df = pd.DataFrame(df_data)
+        df.to_parquet(output_path, compression='snappy', index=False)
+        logger.info(f"Saved {len(processed)} MSAs to {output_path} (Parquet format)")
+        
+    else:
+        # Save as JSONL (legacy format)
+        if not output_path.suffix:
+            output_path = output_path / 'msas.jsonl'
+        with open(output_path, 'w') as f:
+            for item in processed:
+                f.write(json.dumps(item) + '\n')
+        logger.info(f"Saved {len(processed)} MSAs to {output_path} (JSONL format)")
 
     # Save stats
     stats = {
@@ -115,10 +143,25 @@ def generate_preferences_command(args):
 
     # Load processed MSAs
     msas = []
-    with open(args.input, 'r') as f:
-        for line in f:
-            if line.strip():
-                msas.append(json.loads(line))
+    input_path = Path(args.input)
+    
+    # Handle both .jsonl and .parquet formats
+    if input_path.suffix == '.parquet':
+        import pandas as pd
+        logger.info(f"Loading parquet file from {args.input}")
+        df = pd.read_parquet(args.input)
+        for _, row in df.iterrows():
+            msa_dict = row.to_dict()
+            # Parse sequences_json if it exists
+            if 'sequences_json' in msa_dict:
+                msa_dict['sequences'] = json.loads(msa_dict['sequences_json'])
+            msas.append(msa_dict)
+    else:
+        # Assume JSONL format
+        with open(args.input, 'r') as f:
+            for line in f:
+                if line.strip():
+                    msas.append(json.loads(line))
 
     logger.info(f"Loaded {len(msas)} MSAs")
 
@@ -255,8 +298,8 @@ def main():
 
     # Process command
     process_parser = subparsers.add_parser('process', help='Process and filter MSAs')
-    process_parser.add_argument('--input', type=str, required=True, help='Input directory')
-    process_parser.add_argument('--output', type=str, required=True, help='Output directory')
+    process_parser.add_argument('--input', type=str, required=True, help='Input directory with A3M files')
+    process_parser.add_argument('--output', type=str, required=True, help='Output path (.parquet for fast loading, or directory for JSONL)')
     process_parser.add_argument('--min-length', type=int, default=25, help='Min sequence length')
     process_parser.add_argument('--max-length', type=int, default=2000, help='Max sequence length')
     process_parser.add_argument('--min-identity', type=float, default=0.30, help='Min sequence identity')
@@ -267,8 +310,8 @@ def main():
 
     # Generate preferences command
     pref_parser = subparsers.add_parser('generate-preferences', help='Generate preference pairs')
-    pref_parser.add_argument('--input', type=str, required=True, help='Input JSONL file')
-    pref_parser.add_argument('--output', type=str, required=True, help='Output JSONL file')
+    pref_parser.add_argument('--input', type=str, required=True, help='Input file (.parquet or .jsonl)')
+    pref_parser.add_argument('--output', type=str, required=True, help='Output JSONL file for preference pairs')
     pref_parser.add_argument('--model-path', type=str, default=None, help='Path to trained model')
     pref_parser.add_argument('--num-samples', type=int, default=8, help='Samples per query')
     pref_parser.add_argument('--max-queries', type=int, default=10000, help='Max queries to process')

@@ -135,6 +135,7 @@ class MSADataset(Dataset):
         cache_dir: Optional[str] = None,
         use_few_shot: bool = False,
         few_shot_examples: int = 2,
+        preload: bool = False,
     ):
         """
         Initialize the dataset.
@@ -158,17 +159,33 @@ class MSADataset(Dataset):
         self.use_few_shot = use_few_shot
         self.few_shot_examples = few_shot_examples if use_few_shot else 0
 
-        # Load data
+        # Load data (optionally lazy)
+        self.preload = preload
+        self._entry_cache: Dict[int, MSAEntry] = {}
+        self._cache_max = 1024
+
         if isinstance(data_source, str):
             self.loader = OpenProteinSetLoader(data_source)
-            self.msa_entries = list(self.loader)
+            if self.preload:
+                self.msa_entries = list(self.loader)
+            else:
+                self.msa_entries = None
+                self.msa_files = self.loader.get_file_list()
         elif isinstance(data_source, OpenProteinSetLoader):
             self.loader = data_source
-            self.msa_entries = list(data_source)
+            if self.preload:
+                self.msa_entries = list(data_source)
+            else:
+                self.msa_entries = None
+                self.msa_files = self.loader.get_file_list()
         else:
             self.msa_entries = data_source
+            self.loader = None
 
-        logger.info(f"Loaded {len(self.msa_entries)} MSA entries")
+        if self.preload:
+            logger.info(f"Loaded {len(self.msa_entries)} MSA entries")
+        else:
+            logger.info(f"Using lazy loading over {len(self.msa_files)} MSA files")
 
         # Cache if needed
         if cache_dir:
@@ -182,7 +199,9 @@ class MSADataset(Dataset):
         pass
 
     def __len__(self) -> int:
-        return len(self.msa_entries)
+        if self.msa_entries is not None:
+            return len(self.msa_entries)
+        return len(self.msa_files)
 
     def _sample_msa_sequences(self, msa_entry: MSAEntry) -> Tuple[List[str], List[str]]:
         """
@@ -345,7 +364,25 @@ class MSADataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """Get a single training example."""
-        msa_entry = self.msa_entries[idx]
+        if self.msa_entries is not None:
+            msa_entry = self.msa_entries[idx]
+        else:
+            # Lazy load from file list with simple cache and fallback search
+            if idx in self._entry_cache:
+                msa_entry = self._entry_cache[idx]
+            else:
+                msa_entry = None
+                total = len(self.msa_files)
+                for offset in range(total):
+                    path = self.msa_files[(idx + offset) % total]
+                    msa_entry = self.loader.load_msa(path)
+                    if msa_entry is not None:
+                        self._entry_cache[idx] = msa_entry
+                        if len(self._entry_cache) > self._cache_max:
+                            self._entry_cache.pop(next(iter(self._entry_cache)))
+                        break
+                if msa_entry is None:
+                    raise IndexError("No valid MSA entries found.")
 
         # Sample MSA sequences
         if self.use_few_shot:

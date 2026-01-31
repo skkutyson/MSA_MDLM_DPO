@@ -34,6 +34,7 @@ from model_utils.mdlm.protein_dit import ProteinDIT
 from model_utils.mdlm.diffusion import ProteinDiffusion
 from model_utils.mdlm.noise_schedule import get_noise_schedule
 from training.datasets import MSADataset, MSACollator, create_dataloader
+from training.datasets import ArrowMSADataset, LMDBMSADataset, create_fast_dataloader
 from training.trainers import MDLMTrainer
 
 logging.basicConfig(
@@ -154,16 +155,42 @@ def main():
 
     # Create datasets
     data_config = config['data']
-    
-    # Check if using processed JSONL or raw directory
     data_path = data_config['path']
-    
-    if isinstance(data_path, str) and data_path.endswith('.jsonl'):
-        # Load from processed JSONL (much faster!)
+
+    # Dataset kwargs
+    dataset_kwargs = {
+        'max_seq_length': data_config.get('max_seq_length', 2048),
+        'max_msa_depth': data_config.get('max_msa_depth', 64),
+        'num_msa_sequences': data_config.get('num_msa_sequences', 8),
+        'use_few_shot': data_config.get('use_few_shot', False),
+        'few_shot_examples': data_config.get('few_shot_examples', 2),
+    }
+
+    # Detect data format and use appropriate fast loader
+    data_path_obj = Path(data_path)
+
+    if data_path_obj.suffix in ['.parquet', '.arrow']:
+        # ===== FAST: Arrow/Parquet format (memory-mapped) =====
+        logger.info(f"Loading from Arrow/Parquet: {data_path} (fast memory-mapped loading)")
+        train_dataset = ArrowMSADataset(data_path, **dataset_kwargs)
+
+    elif data_path_obj.is_dir() and (data_path_obj / 'data.mdb').exists():
+        # ===== FAST: LMDB format (memory-mapped key-value) =====
+        logger.info(f"Loading from LMDB: {data_path} (fast memory-mapped loading)")
+        train_dataset = LMDBMSADataset(data_path, **dataset_kwargs)
+
+    elif data_path_obj.is_dir() and list(data_path_obj.glob('shard-*.tar')):
+        # ===== FAST: WebDataset shards (streaming) =====
+        logger.info(f"Loading from WebDataset shards: {data_path} (streaming)")
+        from training.datasets import WebDatasetMSA
+        train_dataset = WebDatasetMSA(data_path, **dataset_kwargs)
+
+    elif isinstance(data_path, str) and data_path.endswith('.jsonl'):
+        # ===== MEDIUM: JSONL format =====
         import json
         from training.datasets.openproteinset_loader import MSAEntry
-        
-        logger.info(f"Loading from processed JSONL: {data_path}")
+
+        logger.info(f"Loading from JSONL: {data_path}")
         msa_entries = []
         with open(data_path, 'r') as f:
             for line in f:
@@ -175,33 +202,39 @@ def main():
                     sequence_ids=[f"seq_{i}" for i in range(len(item['sequences']))],
                 )
                 msa_entries.append(entry)
-        
+
         logger.info(f"Loaded {len(msa_entries)} MSA entries from JSONL")
+        train_dataset = MSADataset(data_source=msa_entries, **dataset_kwargs)
+
     else:
-        # Load from raw directory (slow - scans all files)
+        # ===== SLOW: Raw directory (scans all A3M files) =====
         from training.datasets.openproteinset_loader import OpenProteinSetLoader
-        
+
+        logger.warning("=" * 60)
+        logger.warning("SLOW LOADING: Reading from raw A3M files.")
+        logger.warning("For faster loading (10-100x), preprocess your data:")
+        logger.warning("")
+        logger.warning("  python scripts/preprocess_msa_data.py \\")
+        logger.warning(f"      --input {data_path} \\")
+        logger.warning(f"      --output {data_path}.parquet \\")
+        logger.warning("      --format arrow --num-workers 16")
+        logger.warning("")
+        logger.warning("Then use: --data.path {}.parquet".format(data_path))
+        logger.warning("=" * 60)
+
         logger.info(f"Loading from raw directory: {data_path}")
         loader = OpenProteinSetLoader(data_path)
-        
-        # Optionally limit to first N samples for faster iteration
+
         max_samples = data_config.get('max_samples', None)
         if max_samples:
             import itertools
-            logger.info(f"Loading first {max_samples} samples only (for quick testing)")
+            logger.info(f"Loading first {max_samples} samples only")
             msa_entries = list(itertools.islice(loader, max_samples))
         else:
-            logger.info("Loading all samples (this may take several minutes)...")
+            logger.info("Loading all samples (this may take a while)...")
             msa_entries = list(loader)
-    
-    train_dataset = MSADataset(
-        data_source=msa_entries,
-        max_seq_length=data_config.get('max_seq_length', 2048),
-        max_msa_depth=data_config.get('max_msa_depth', 64),
-        num_msa_sequences=data_config.get('num_msa_sequences', 8),
-        use_few_shot=data_config.get('use_few_shot', False),
-        few_shot_examples=data_config.get('few_shot_examples', 2),
-    )
+
+        train_dataset = MSADataset(data_source=msa_entries, **dataset_kwargs)
 
     # Check for empty dataset
     if len(train_dataset) == 0:

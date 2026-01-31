@@ -17,6 +17,8 @@ MDLM Flow:
 
 ## 2. Core Model Components (`model_utils/mdlm/`)
 
+**CRITICAL**: MDLM uses a **BACKWARDS noise schedule** where small t = high σ = maximum masking. This is the opposite of standard diffusion. See [MDLM_CONVENTION_CLARIFICATION.md](MDLM_CONVENTION_CLARIFICATION.md) before reading further.
+
 ### 2.1 ProteinDIT (`protein_dit.py`)
 A Diffusion Transformer backbone adapted for proteins:
 
@@ -63,12 +65,29 @@ LogLinear schedule from MDLM paper:
 
 ```python
 class LogLinearNoise:
-    def __call__(self, t):
+    def forward(self, t):
         # σ(t) = 1 - (1-ε)·t
-        # At t=1: σ=ε (almost no masking)
-        # At t=0: σ≈1 (fully masked)
+        #
+        # IMPORTANT: This is a REVERSED convention!
+        # t ~ U(ε, 1) during training (sampled randomly)
+        # 
+        # Small t (t≈ε):     σ ≈ 1   (MAXIMUM masking)
+        # Large t (t≈1):     σ ≈ 0   (MINIMUM masking)
+        #
+        # This is BACKWARDS from standard diffusion where
+        # larger t = more noise. See MDLM_CONVENTION_CLARIFICATION.md
         return 1 - (1 - self.eps) * t
 ```
+
+**Key Understanding**: 
+- σ represents the **amount of masking** applied to the input
+- σ = 0: ~0% of tokens masked (input is mostly original)
+- σ = 1: ~100% of tokens masked (input is all MASK tokens)
+
+During **training**: t sampled from U(ε, 1), giving varied σ values
+During **sampling**: t goes from 1 → 0, which INCREASES σ (more re-masking)
+
+See [MDLM_CONVENTION_CLARIFICATION.md](MDLM_CONVENTION_CLARIFICATION.md) for complete explanation of why this backwards convention works.
 
 ### 2.4 MSAGPT_MDLM Wrapper (`model_msagpt_mdlm.py`)
 SAT-compatible interface for CLI integration:
@@ -97,48 +116,125 @@ class MSAGPT_MDLM(nn.Module):
 
 ## 3. Sampling Methods (`diffusion.py`)
 
-### 3.1 Standard DDPM Sampling
+### 3.1 DDPM Sampling with Denoising and Re-masking
+
+The actual MDLM sampling process follows this pattern:
+
 ```python
-def sample(self, batch_size, seq_len, num_steps, ...):
-    x = torch.full(..., mask_token_id)  # Start fully masked
-
+def sample(self, batch_size, seq_len, num_steps=256, ...):
+    # Step 1: Initialize with all mask tokens (t=0, fully masked)
+    x = torch.full((batch_size, seq_len), mask_token_id)
+    
+    # Step 2: Iterate from t=1 (nearly clean) to t=0 (fully masked)
+    #         This is DENOISING - gradually revealing the original tokens
+    dt = 1.0 / num_steps  # e.g., dt = 1/256
+    
     for step in range(num_steps):
-        t = 1.0 - step / num_steps
-        sigma = self.noise_schedule(t)
-
-        # Get predictions
-        logits = self.get_logits(x, sigma, position_ids, block_position_ids)
-
-        # Apply invalid token masking
-        for token_id in invalid_token_ids:
-            logits[..., token_id] = float('-inf')
-
-        # Sample
-        probs = F.softmax(logits / temperature, dim=-1)
-        x_pred = torch.multinomial(probs.view(-1, vocab_size), 1)
-
-        # Re-mask some predictions (not final step)
-        if step < num_steps - 1:
-            remask = torch.rand_like(x.float()) < sigma_next
-            x = torch.where(remask, mask_token_id, x_pred)
+        t = 1.0 - step * dt  # t: 1.0 → 0.9961 → ... → 0.0
+        sigma = noise_schedule(t)  # σ(t) = 1-(1-ε)·t
+        
+        # Step 2a: Get predictions from model
+        # Model sees partially masked input x with noise level sigma
+        logits = model(x, sigma=sigma, position_ids=..., block_position_ids=...)
+        
+        # Step 2b: Sample predictions
+        probs = softmax(logits / temperature)
+        x_pred = multinomial_sample(probs)  # Predicted tokens at this step
+        
+        # Step 2c: DDPM UPDATE - This is the KEY part
+        # Decide whether to keep the prediction or re-mask it
+        if step < num_steps - 1:  # Not the last step
+            t_next = 1.0 - (step + 1) * dt  # Next timestep (even closer to t=0)
+            sigma_next = noise_schedule(t_next)  # Even lower noise
+            
+            # move_chance = σ_next: probability of keeping mask token
+            # σ_next is the noise level for the NEXT step
+            # As t decreases, σ INCREASES (not decreases!)
+            # σ(t) = 1 - (1-ε)·t, so at t=0: σ=1, at t=1: σ≈0
+            move_chance = sigma_next
+            
+            # Re-mask some predictions with probability σ_next
+            # Early steps (high t): σ_next ≈ 0.001, very few re-masks
+            # Late steps (low t): σ_next ≈ 1.0, most get re-masked
+            # This is CONFIDENCE-BASED filtering!
+            remask = rand() < move_chance
+            x = where(remask, mask_token_id, x_pred)
         else:
+            # Final step: use predictions directly without re-masking
             x = x_pred
-
-        # Restore context
-        x = torch.where(context_mask.bool(), context_tokens, x)
+        
+        # Step 2d: Always restore context tokens
+        # Query and few-shot examples never get masked
+        x = where(context_mask, context_tokens, x)
+    
+    return x
 ```
 
-### 3.2 DDPM with Caching (faster)
-Tracks which positions are "revealed" and only re-masks unrevealed positions:
+**Visualization of the re-masking pattern**:
+```
+Early steps (t close to 1.0):
+  σ_next ≈ 0.001 (low)
+  move_chance ≈ 0.001
+  Re-mask ~0.1% of predictions
+  Keep ~99.9% of model outputs
+  
+Middle steps (t ≈ 0.5):
+  σ_next ≈ 0.5
+  move_chance ≈ 0.5
+  Re-mask ~50% of predictions
+  Keep ~50% of model outputs
+  
+Late steps (t close to 0):
+  σ_next ≈ 1.0 (high)
+  move_chance ≈ 1.0
+  Re-mask ~100% of unselected tokens
+  Only keep final confident predictions
+```
+
+**The core MDLM mechanism (as you correctly described)**:
+1. **Model predicts original tokens from noisy input**: x_pred = sample from p(x_0|x_t)
+2. **Stochastic re-masking based on sigma_next**: Some predictions are masked again with probability σ_next
+3. **Progressive acceptance**: Early predictions are tentatively kept, late predictions must be confident
+4. **Final step**: No re-masking, final predictions are kept
+
+See [MDLM_NOISE_AND_SAMPLING_DETAILED.md](MDLM_NOISE_AND_SAMPLING_DETAILED.md) for complete analysis with numerical examples.
+
+---
+
+## 3.3 Batch Processing and Loss Calculation
+
+**Important**: Despite using random t sampling, training covers all noise levels adequately.
+
 ```python
-def sample_ddpm_caching(self, ...):
-    revealed = torch.zeros_like(x, dtype=torch.bool)
+# In each training step:
+batch_size = 32
 
-    for step in range(num_steps):
-        # Only update unrevealed positions
-        # Progressively reveal based on confidence scores
-        ...
+# Each sample gets different t:
+t = torch.rand(batch_size) * (1 - eps) + eps
+# Example: [0.1, 0.8, 0.3, 0.6, 0.2, 0.9, ...]
+
+# Different σ for each sample:
+sigma = noise_schedule(t)
+# Example: [0.9, 0.2, 0.7, 0.4, 0.8, 0.1, ...]
+
+# Each sample gets different masking amount
+mask = torch.rand_like(x0.float()) < sigma.unsqueeze(-1)
+
+# Loss is AVERAGED over batch
+loss = (nll * loss_mask).sum() / (loss_mask.sum())  # Scalar
 ```
+
+**Over many batches**:
+```
+Batch 1: 32 samples with random t ∈ [ε, 1]
+Batch 2: 32 samples with random t ∈ [ε, 1]
+...
+After 100K steps: 3.2M samples with uniform σ distribution
+```
+
+All noise levels are covered. Training is sufficient!
+
+See [TRAINING_BATCH_AND_ACCUMULATION.md](TRAINING_BATCH_AND_ACCUMULATION.md) for detailed batch, loss, and gradient accumulation explanation.
 
 ---
 
@@ -233,32 +329,66 @@ class MSAPreferenceDataset:
 ```
 
 ### 6.2 Loss Functions
+
+**Key difference**: MDLM training is fundamentally different from autoregressive training.
+
 ```python
-# Pre-training: Diffusion NLL
+# Training: Sample timestep, apply noise, predict original
 def compute_diffusion_loss(model, x0, position_ids, block_position_ids, noise_schedule, ...):
-    t = torch.rand(batch_size)
-    sigma = noise_schedule(t)
-    log_probs = model.forward(x0, sigma, position_ids, block_position_ids, context_mask)
-    loss = F.nll_loss(log_probs.view(-1, vocab_size), x0.view(-1))
-    return loss
-
-# DPO: D3PO for diffusion
-def compute_dpo_loss(winner_batch, loser_batch, policy_model, ref_model, beta=0.1):
-    # Sample shared timestep
-    t = torch.rand(batch_size)
-
-    # Compute log-likelihoods
-    winner_log_prob = compute_log_prob(winner_batch, policy_model)
-    loser_log_prob = compute_log_prob(loser_batch, policy_model)
-    winner_log_prob_ref = compute_log_prob(winner_batch, ref_model)  # frozen
-    loser_log_prob_ref = compute_log_prob(loser_batch, ref_model)
-
-    # Bradley-Terry loss
-    winner_ratio = winner_log_prob - winner_log_prob_ref
-    loser_ratio = loser_log_prob - loser_log_prob_ref
-    loss = -F.logsigmoid(beta * (winner_ratio - loser_ratio))
-    return loss
+    batch_size, seq_len = x0.shape
+    device = x0.device
+    
+    # Step 1: Sample random timesteps for this batch
+    # t ~ U(eps, 1): higher t = less noise, lower t = more noise
+    t = torch.rand(batch_size, device=device) * (1 - eps) + eps
+    sigma = noise_schedule(t)  # σ(t) = 1-(1-ε)·t
+    
+    # Step 2: Apply noise (masking) to create x_t from x_0
+    # move_chance = sigma: probability of masking each token
+    move_chance = sigma.unsqueeze(-1)
+    
+    # Don't mask context tokens (query, few-shot examples)
+    if context_mask is not None:
+        move_chance = move_chance * (1 - context_mask.float())
+    
+    # Step 3: Create noisy input x_t
+    # Mask tokens where random < move_chance
+    mask = torch.rand_like(x0.float()) < move_chance
+    x_t = torch.where(mask, mask_token_id, x0)
+    
+    # Restore context tokens (never masked during training)
+    if context_mask is not None:
+        x_t = torch.where(context_mask.bool(), x0, x_t)
+    
+    # Step 4: Forward pass
+    # Model sees noisy input x_t and must predict original tokens x_0
+    logits = model(
+        input_ids=x_t,
+        sigma=sigma,
+        position_ids=position_ids,
+        block_position_ids=block_position_ids,
+    )
+    
+    # Step 5: Compute loss
+    # Cross-entropy between predicted and true original tokens
+    log_probs = F.log_softmax(logits, dim=-1)
+    nll = F.nll_loss(log_probs.view(-1, vocab_size), x0.view(-1), reduction='none')
+    
+    # Only compute loss on non-context tokens
+    loss_mask = 1 - context_mask.float() if context_mask is not None else 1.0
+    loss = (nll * loss_mask).sum() / (loss_mask.sum() + 1e-8)
+    
+    return {'loss': loss, 'accuracy': accuracy, ...}
 ```
+
+**Key insight about training vs sampling**:
+
+| Phase | Input | Model Task | What happens after |
+|-------|-------|-----------|-------------------|
+| **Training** | x_t (noisy) | Predict x_0 | Compute cross-entropy loss |
+| **Sampling** | x_t (noisy) | Predict x_0 | Sample predictions, re-mask with probability σ_next, iterate |
+
+The model is trained to predict the original tokens from noisy input. During sampling, we use this prediction ability iteratively, with progressive re-masking.
 
 ---
 

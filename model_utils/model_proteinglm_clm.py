@@ -14,6 +14,13 @@ from sat.model.position_embedding import RotaryEmbedding
 from sat.model.position_embedding import apply_rotary_pos_emb_index
 from sat.ops import LayerNorm
 
+# Try to import FlashAttention
+try:
+    from flash_attn import flash_attn_func
+    FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    FLASH_ATTN_AVAILABLE = False
+
 
 class RotaryEmbeddingMixin(BaseMixin):
     def __init__(
@@ -151,12 +158,13 @@ class DeepNormWithGLUMixin(BaseMixin):
 
 
 class SelfAttentionWithFP32SoftmaxMixin(BaseMixin):
-    def __init__(self, fp16, hidden_size, num_attention_heads, model_parallel_size):
+    def __init__(self, fp16, hidden_size, num_attention_heads, model_parallel_size, use_flash_attn=True):
         super().__init__()
         self.hidden_size_per_attention_head = divide(hidden_size, num_attention_heads)
         self.hidden_size_per_partition = divide(hidden_size, model_parallel_size)
         self.scale_mask_softmax = None
         self.fp16 = fp16
+        self.use_flash_attn = use_flash_attn and FLASH_ATTN_AVAILABLE
 
     @staticmethod
     def attention_mask_func(attention_scores, attention_mask):
@@ -200,12 +208,61 @@ class SelfAttentionWithFP32SoftmaxMixin(BaseMixin):
             key_layer = torch.cat((memk, key_layer), dim=0)
             value_layer = torch.cat((memv, value_layer), dim=0)
 
-
         # check if use flash attention
         is_low_triangle = (attention_mask == ~torch.ones_like(attention_mask, dtype=torch.bool).tril()).all()
         is_full = (attention_mask is None) or (attention_mask == 0).all()
-        if int(torch.__version__.split('.')[0]) >= 2 and (is_full or is_low_triangle):
-            # Pytorch 2.0 attention uses very much memory if attention_mask is float, and has NaN bug if attention_mask is None.
+
+        # Use FlashAttention if available and enabled
+        if self.use_flash_attn and (is_full or is_low_triangle):
+            dropout_p = 0. if attention_dropout is None or not attention_dropout.training else attention_dropout.p
+            # FlashAttention expects (batch, seqlen, heads, head_dim)
+            # Current shape: [sq, b, np, hn]
+            query_layer = query_layer.permute(1, 0, 2, 3).contiguous()  # [b, sq, np, hn]
+            key_layer = key_layer.permute(1, 0, 2, 3).contiguous()      # [b, sk, np, hn]
+            value_layer = value_layer.permute(1, 0, 2, 3).contiguous()  # [b, sk, np, hn]
+
+            batch_size, sq, num_query_heads = query_layer.shape[:3]
+            num_kv_heads = key_layer.shape[2]
+
+            # Handle GQA (Grouped Query Attention) if num_query_heads != num_kv_heads
+            if num_query_heads != num_kv_heads:
+                # Expand KV heads to match query heads
+                key_layer = key_layer.unsqueeze(3).expand(-1, -1, -1, num_query_heads // num_kv_heads, -1)
+                key_layer = key_layer.reshape(batch_size, -1, num_query_heads, hidden_size)
+                value_layer = value_layer.unsqueeze(3).expand(-1, -1, -1, num_query_heads // num_kv_heads, -1)
+                value_layer = value_layer.reshape(batch_size, -1, num_query_heads, hidden_size)
+
+            # Convert to half precision for FlashAttention if needed
+            orig_dtype = query_layer.dtype
+            if orig_dtype not in [torch.float16, torch.bfloat16]:
+                query_layer = query_layer.half()
+                key_layer = key_layer.half()
+                value_layer = value_layer.half()
+
+            if dropout_p > 0 and mpu.get_cuda_rng_tracker is not None:
+                context = mpu.get_cuda_rng_tracker().fork()
+            else:
+                context = contextlib.nullcontext()
+
+            with context:
+                context_layer = flash_attn_func(
+                    query_layer, key_layer, value_layer,
+                    dropout_p=dropout_p,
+                    causal=not is_full,
+                )
+
+            # Convert back to original dtype
+            if orig_dtype not in [torch.float16, torch.bfloat16]:
+                context_layer = context_layer.to(orig_dtype)
+
+            # [b, sq, np, hn] --> [sq, b, hp]
+            context_layer = context_layer.permute(1, 0, 2, 3).contiguous()
+            new_context_layer_shape = context_layer.size()[:-2] + (-1,)
+            context_layer = context_layer.view(*new_context_layer_shape)
+            return context_layer
+
+        elif int(torch.__version__.split('.')[0]) >= 2 and (is_full or is_low_triangle):
+            # Pytorch 2.0 SDPA fallback
             dropout_p = 0. if attention_dropout is None or not attention_dropout.training else attention_dropout.p
             #[b, np, sq, hn]
             query_layer, key_layer, value_layer = query_layer.permute(1,2,0,3).contiguous(), key_layer.permute(1,2,0,3).contiguous(), value_layer.permute(1,2,0,3).contiguous()
@@ -221,12 +278,11 @@ class SelfAttentionWithFP32SoftmaxMixin(BaseMixin):
 
             with context:
                 context_layer = torch.nn.functional.scaled_dot_product_attention(
-                    query_layer, key_layer, value_layer, 
+                    query_layer, key_layer, value_layer,
                     attn_mask=None,
                     dropout_p=dropout_p,
                     is_causal=not is_full
                 )
-
 
             #[sq, b, np, hn]
             context_layer = context_layer.permute(2, 0, 1, 3).contiguous()
@@ -272,14 +328,14 @@ class SelfAttentionWithFP32SoftmaxMixin(BaseMixin):
 
             # change view to [b, np, sq, sk]
             attention_scores = matmul_result.view(*output_size)
-            
+
             if not (attention_mask.shape[-2] == 1 and (attention_mask > 0).all()):
                 # if auto-regressive, skip
                 attention_scores.masked_fill_(attention_mask.bool(), -float("inf"))
 
             attention_scores = attention_scores.float()
             attention_scores = attention_scores * query_key_layer_scaling_coeff
-        
+
 
             attention_probs = F.softmax(attention_scores, dim=-1)
 
@@ -294,11 +350,11 @@ class SelfAttentionWithFP32SoftmaxMixin(BaseMixin):
                         attention_probs = attention_dropout(attention_probs)
                 else:
                     attention_probs = attention_dropout(attention_probs)
-                
+
             # =========================
             # Context layer. [sq, b, hp]
             # =========================
-            
+
             # value_layer -> context layer.
             # [sk, b, np, hn] --> [b, np, sq, hn]
 
@@ -311,7 +367,7 @@ class SelfAttentionWithFP32SoftmaxMixin(BaseMixin):
             # change view [b * np, sq, sk]
             attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
             # matmul: [b * np, sq, hn]
-                
+
             context_layer = torch.bmm(attention_probs, value_layer.transpose(0, 1))
 
             # change view [b, np, sq, hn]
@@ -394,9 +450,10 @@ class ProteinGLMForGeneration(BaseModel):
             **kwargs
         )
         self.add_mixin("glu-deepnorm", DeepNormWithGLUMixin(args.num_layers, args.hidden_size, args.inner_hidden_size))
+        use_flash_attn = getattr(args, 'use_flash_attn', True)
         self.add_mixin(
             "fp32-softmax",
-            SelfAttentionWithFP32SoftmaxMixin(args.fp16, args.hidden_size, args.num_attention_heads, args.model_parallel_size),
+            SelfAttentionWithFP32SoftmaxMixin(args.fp16, args.hidden_size, args.num_attention_heads, args.model_parallel_size, use_flash_attn=use_flash_attn),
         )
         if args.untie_head:
             self.add_mixin("final-forward", UntieFinalForwardMixin(args.hidden_size, args.vocab_size, args.head_num))
@@ -424,5 +481,9 @@ class ProteinGLMForGeneration(BaseModel):
         group.add_argument('--head-num', default=1, type=int, help='head>1')
         group.add_argument('--infer-type', default=1, type=int, help='1 for Generation')
         group.add_argument('--rotary-embedding-2d', action='store_true',
-                help='If set, use 2D rotary embedding for ProtenGLM.') 
+                help='If set, use 2D rotary embedding for ProtenGLM.')
+        group.add_argument('--use-flash-attn', action='store_true', default=True,
+                help='Use FlashAttention for faster attention computation (default: True)')
+        group.add_argument('--no-flash-attn', action='store_false', dest='use_flash_attn',
+                help='Disable FlashAttention')
         return super().add_model_specific_args(parser)

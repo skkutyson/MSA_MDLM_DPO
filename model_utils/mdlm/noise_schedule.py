@@ -25,15 +25,15 @@ class NoiseSchedule(abc.ABC, nn.Module):
 
 class LogLinearNoise(NoiseSchedule):
     """
-    Log-linear noise schedule.
+    Log-linear noise schedule (STANDARD CONVENTION).
 
-    sigma(t) = 1 - (1 - eps) * t
+    sigma(t) = eps + (1 - eps) * t
 
     This gives:
-    - sigma(0) = 1 (fully masked)
-    - sigma(1) = eps (nearly unmasked)
+    - sigma(0) = eps (nearly clean)
+    - sigma(1) = 1 (fully noisy/masked)
 
-    The rate is constant: d(sigma)/dt = -(1 - eps)
+    The rate is constant: d(sigma)/dt = (1 - eps)
     """
 
     def __init__(self, eps: float = 1e-3):
@@ -46,7 +46,7 @@ class LogLinearNoise(NoiseSchedule):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         """
-        Compute sigma(t) = 1 - (1 - eps) * t.
+        Compute sigma(t) = eps + (1 - eps) * t.
 
         Args:
             t: Timesteps in [0, 1], shape (batch_size,) or scalar
@@ -54,11 +54,11 @@ class LogLinearNoise(NoiseSchedule):
         Returns:
             Noise level sigma(t), same shape as t
         """
-        return 1 - (1 - self.eps) * t
+        return self.eps + (1 - self.eps) * t
 
     def rate(self, t: torch.Tensor) -> torch.Tensor:
         """
-        Compute d(sigma)/dt = -(1 - eps).
+        Compute d(sigma)/dt = (1 - eps).
 
         Args:
             t: Timesteps (not used, but included for API consistency)
@@ -66,18 +66,18 @@ class LogLinearNoise(NoiseSchedule):
         Returns:
             Rate of change, same shape as t
         """
-        return torch.full_like(t, -(1 - self.eps))
+        return torch.full_like(t, (1 - self.eps))
 
 
 class CosineNoise(NoiseSchedule):
     """
-    Cosine noise schedule.
+    Cosine noise schedule (STANDARD CONVENTION).
 
-    sigma(t) = cos(pi/2 * t)
+    sigma(t) = 1 - cos(pi/2 * t)
 
     This gives:
-    - sigma(0) = 1 (fully masked)
-    - sigma(1) = 0 (fully unmasked)
+    - sigma(0) = 0 (fully clean)
+    - sigma(1) = 1 (fully noisy/masked)
     """
 
     def __init__(self, eps: float = 1e-3):
@@ -85,15 +85,15 @@ class CosineNoise(NoiseSchedule):
         self.eps = eps
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute sigma(t) = cos(pi/2 * t)."""
+        """Compute sigma(t) = 1 - cos(pi/2 * t)."""
         import math
-        sigma = torch.cos(math.pi / 2 * t)
-        return sigma.clamp(min=self.eps)
+        sigma = 1 - torch.cos(math.pi / 2 * t)
+        return sigma.clamp(min=self.eps, max=1.0)
 
     def rate(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute d(sigma)/dt = -pi/2 * sin(pi/2 * t)."""
+        """Compute d(sigma)/dt = pi/2 * sin(pi/2 * t)."""
         import math
-        return -math.pi / 2 * torch.sin(math.pi / 2 * t)
+        return math.pi / 2 * torch.sin(math.pi / 2 * t)
 
 
 def get_noise_schedule(name: str, **kwargs) -> NoiseSchedule:

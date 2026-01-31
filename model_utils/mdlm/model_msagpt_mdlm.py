@@ -55,6 +55,7 @@ class MSAGPT_MDLM(nn.Module):
         dropout = getattr(args, 'hidden_dropout', getattr(args, 'dropout', 0.0))
         noise_type = getattr(args, 'noise_type', 'loglinear')
         mask_token_id = getattr(args, 'mask_token_id', 36)  # DIFFUSION_MASK token ID
+        use_flash_attn = getattr(args, 'use_flash_attn', True)
 
         # Get vocab_size - SAT pads vocab to 128, so always use 128
         # SAT sets args.vocab_size to the unpadded size (e.g., 100), but the
@@ -72,6 +73,7 @@ class MSAGPT_MDLM(nn.Module):
             cond_dim=cond_dim,
             mlp_ratio=mlp_ratio,
             dropout=dropout,
+            use_flash_attn=use_flash_attn,
         )
 
         # Create noise schedule
@@ -364,6 +366,10 @@ class MSAGPT_MDLM(nn.Module):
                           help='Type of noise schedule')
         group.add_argument('--mask-token-id', type=int, default=36,
                           help='Token ID used for masking in diffusion (default: DIFFUSION_MASK=36)')
+        group.add_argument('--use-flash-attn', action='store_true', default=True,
+                          help='Use FlashAttention for faster attention computation (default: True)')
+        group.add_argument('--no-flash-attn', action='store_false', dest='use_flash_attn',
+                          help='Disable FlashAttention')
 
         return parser
 

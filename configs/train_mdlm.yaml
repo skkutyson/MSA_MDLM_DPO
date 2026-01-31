@@ -15,7 +15,7 @@ model:
 
 # Data
 data:
-  path: ./data/openproteinset
+  path: ./data/processed/msa_data.parquet  # Use parquet for fast loading (or ./data/openproteinset for raw A3M)
   max_seq_length: 2048
   max_msa_depth: 64
   num_msa_sequences: 8
@@ -30,13 +30,13 @@ data:
 
 # Training (from MSAGPT paper, batch_size=48)
 training:
-  batch_size: 2
+  batch_size: 4
   max_residues_per_batch: 12288
   learning_rate: 1.2e-4
   weight_decay: 0.01
   betas: [0.9, 0.95]
   warmup_ratio: 0.025
-  max_steps: 100000
+  max_steps: 200000
   max_epochs: -1  # Use steps
   gradient_clip_val: 1.0
   accumulate_grad_batches: 1

@@ -278,10 +278,10 @@ class ProteinDiffusion(nn.Module):
         if context_tokens is not None and context_mask is not None:
             x = torch.where(context_mask.bool(), context_tokens, x)
 
-        # Time steps from 1 to 0
+        # Time steps from 0 to 1 (t increases = noise increases)
         dt = 1.0 / num_steps
         for step in range(num_steps):
-            t = 1.0 - step * dt
+            t = step * dt
             t_tensor = torch.full((batch_size,), t, device=device)
             sigma = self.noise_schedule(t_tensor)
 
@@ -329,8 +329,9 @@ class ProteinDiffusion(nn.Module):
                 t_next_tensor = torch.full((batch_size,), t_next, device=device)
                 sigma_next = self.noise_schedule(t_next_tensor)
 
-                # Probability of keeping the mask token
-                # move_chance decreases as we get closer to t=0
+                # Probability of re-masking
+                # As t decreases, sigma decreases, so we keep fewer masks
+                # sigma_next < sigma, so we re-mask only sigma_next fraction
                 move_chance = sigma_next.unsqueeze(-1)
 
                 # Re-mask some predictions
@@ -396,7 +397,7 @@ class ProteinDiffusion(nn.Module):
             x = torch.where(context_mask.bool(), context_tokens, x)
             revealed = revealed | context_mask.bool()
 
-        # Time steps from 1 to 0
+        # Time steps from 1 to 0 (denoising: t decreases = noise decreases)
         dt = 1.0 / num_steps
         for step in range(num_steps):
             t = 1.0 - step * dt
@@ -447,10 +448,11 @@ class ProteinDiffusion(nn.Module):
                 sigma_next = self.noise_schedule(t_next_tensor)
 
                 # Target number of revealed tokens
-                # As sigma decreases, more tokens should be revealed
+                # As sigma decreases (t decreases), we reveal more tokens
+                # revealed_frac = 1 - sigma (more revealed as sigma decreases)
                 unrevealed = ~revealed
                 num_unrevealed = unrevealed.sum(dim=1).float()
-                target_revealed_frac = 1.0 - sigma_next
+                target_revealed_frac = 1.0 - sigma_next  # Lower sigma = more tokens revealed
                 num_to_reveal = (target_revealed_frac * (seq_len - (context_mask.sum(dim=1) if context_mask is not None else 0))).long()
                 num_currently_revealed = revealed.sum(dim=1) - (context_mask.sum(dim=1) if context_mask is not None else 0)
                 num_new_reveal = torch.clamp(num_to_reveal - num_currently_revealed, min=0)
